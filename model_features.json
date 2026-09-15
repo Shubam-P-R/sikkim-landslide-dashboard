@@ -1,0 +1,23 @@
+{
+  "feature_names": [
+    "ASPECT1",
+    "ELEVATION1",
+    "GEOLOGY1",
+    "LULC1",
+    "NDVI1",
+    "RAINFALL1",
+    "ROAD1",
+    "SLOPE1",
+    "SOIL1",
+    "STREAM1"
+  ],
+  "feature_count": 10,
+  "target": "CLASS",
+  "best_model": "Random Forest",
+  "roc_auc": 0.9279,
+  "excluded_columns": [
+    "LONGITUDE",
+    "LATITUDE"
+  ],
+  "description": "Ordered list of features the model expects. Pass values in exactly this order to /predict."
+}

@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: sikkim-landslide-backend
+    env: python
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: DATABASE_URL
+        value: postgresql://neondb_owner:npg_eu3W1bYFTdqL@ep-empty-tree-avfhcwdo-pooler.c-11.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require
