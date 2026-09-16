@@ -7,9 +7,9 @@ Endpoints
   POST /api/report-incident   → user incident submission → Neon DB
 =============================================================================
 """
-
 import json
 import logging
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -34,17 +34,17 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Config
+# Config (Environment Variable with fallback)
 # ---------------------------------------------------------------------------
-DB_URL = (
+DEFAULT_DB_URL = (
     "postgresql+psycopg2://neondb_owner:npg_eu3W1bYFTdqL"
     "@ep-empty-tree-avfhcwdo-pooler.c-11.us-east-1.aws.neon.tech"
-    "/neondb?sslmode=require&channel_binding=require"
+    "/neondb?sslmode=require"
 )
+DB_URL = os.getenv("DATABASE_URL", DEFAULT_DB_URL)
 
-# Resolve paths relative to this file so uvicorn can be started from anywhere
-BASE_DIR      = Path(__file__).resolve().parent.parent  # ML MODEL/
-MODEL_PATH    = BASE_DIR / "landslide_model.pkl"
+BASE_DIR = Path(__file__).resolve().parent.parent
+MODEL_PATH = BASE_DIR / "landslide_model.pkl"
 FEATURES_PATH = BASE_DIR / "model_features.json"
 
 OPEN_METEO_URL = (
@@ -57,21 +57,17 @@ TIER_MAP = [
     (0.25, "Low"),
     (0.50, "Moderate"),
     (0.75, "High"),
-    (1.01, "Critical"),
+    (1.00, "Critical"),
 ]
 
-# ---------------------------------------------------------------------------
-# Global app state  (populated during startup)
-# ---------------------------------------------------------------------------
 app_state: Dict[str, Any] = {}
 
 
 # ---------------------------------------------------------------------------
-# Lifespan — load model + DB engine once at startup
+# Lifespan
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # ── Startup ──────────────────────────────────────────────────────────
     log.info("Loading ML model from %s ...", MODEL_PATH)
     app_state["model"] = joblib.load(MODEL_PATH)
 
@@ -88,14 +84,12 @@ async def lifespan(app: FastAPI):
         pool_pre_ping=True,
         connect_args={"connect_timeout": 10},
     )
-    # Smoke-test the connection
     with app_state["engine"].connect() as conn:
         conn.execute(text("SELECT 1"))
     log.info("Neon PostgreSQL connection verified.")
 
-    yield  # App runs here
+    yield
 
-    # ── Shutdown ─────────────────────────────────────────────────────────
     app_state["engine"].dispose()
     log.info("DB engine disposed. Shutdown complete.")
 
@@ -123,28 +117,28 @@ app.add_middleware(
 # Pydantic Schemas
 # ---------------------------------------------------------------------------
 class PredictRequest(BaseModel):
-    latitude:  float = Field(..., example=27.3139, description="Decimal degrees")
+    latitude: float = Field(..., example=27.3139, description="Decimal degrees")
     longitude: float = Field(..., example=88.4441, description="Decimal degrees")
 
 
 class PredictResponse(BaseModel):
-    risk_score:         float
-    tier:               str
+    risk_score: float
+    tier: str
     nearest_coordinate: Dict[str, float]
-    live_rainfall_mm:   Optional[float]
-    features:           Dict[str, Any]
+    live_rainfall_mm: Optional[float]
+    features: Dict[str, Any]
 
 
 class ReportRequest(BaseModel):
-    latitude:    float  = Field(..., example=27.31)
-    longitude:   float  = Field(..., example=88.44)
-    description: str    = Field(..., example="Crack observed on hillside")
-    severity:    str    = Field(..., example="High")
+    latitude: float = Field(..., example=27.31)
+    longitude: float = Field(..., example=88.44)
+    description: str = Field(..., example="Crack observed on hillside")
+    severity: str = Field(..., example="High")
 
 
 class ReportResponse(BaseModel):
     status: str
-    id:     int
+    id: int
 
 
 # ---------------------------------------------------------------------------
@@ -152,24 +146,20 @@ class ReportResponse(BaseModel):
 # ---------------------------------------------------------------------------
 def classify_tier(prob: float) -> str:
     for threshold, label in TIER_MAP:
-        if prob < threshold:
+        if prob <= threshold:
             return label
     return "Critical"
 
 
 async def fetch_live_rainfall(lat: float, lon: float) -> Optional[float]:
-    """
-    Query Open-Meteo for today's accumulated rain_sum (mm).
-    Returns None on any failure so caller can fall back to DB value.
-    """
     url = OPEN_METEO_URL.format(lat=lat, lon=lon)
+    headers = {"User-Agent": "SikkimLandslideEarlyWarning/1.0"}
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.get(url)
+            resp = await client.get(url, headers=headers)
             resp.raise_for_status()
             data = resp.json()
             rain_list = data.get("daily", {}).get("rain_sum", [])
-            # First element = today's forecast
             if rain_list:
                 val = rain_list[0]
                 return float(val) if val is not None else None
@@ -179,20 +169,19 @@ async def fetch_live_rainfall(lat: float, lon: float) -> Optional[float]:
 
 
 # ---------------------------------------------------------------------------
-# POST /api/predict-risk
+# Endpoints
 # ---------------------------------------------------------------------------
 @app.post("/api/predict-risk", response_model=PredictResponse)
 async def predict_risk(payload: PredictRequest):
     lat, lon = payload.latitude, payload.longitude
-    engine       = app_state["engine"]
-    model        = app_state["model"]
+    engine = app_state["engine"]
+    model = app_state["model"]
     feature_names = app_state["feature_names"]
 
-    # 1. Nearest-neighbor query ─────────────────────────────────────────
     nearest_sql = text("""
         SELECT *
         FROM location_features
-        ORDER BY (("LATITUDE"  - :lat)^2 + ("LONGITUDE" - :lon)^2)
+        ORDER BY (("LATITUDE" - :lat)^2 + ("LONGITUDE" - :lon)^2)
         LIMIT 1;
     """)
     try:
@@ -206,53 +195,39 @@ async def predict_risk(payload: PredictRequest):
         raise HTTPException(status_code=404, detail="No feature data found in DB.")
 
     row = dict(row)
-    nearest_lat = row["LATITUDE"]
-    nearest_lon = row["LONGITUDE"]
+    nearest_lat = float(row["LATITUDE"])
+    nearest_lon = float(row["LONGITUDE"])
     db_rainfall = row.get("RAINFALL1")
 
-    # 2. Live rainfall from Open-Meteo ──────────────────────────────────
     live_rainfall = await fetch_live_rainfall(lat, lon)
     effective_rainfall = live_rainfall if live_rainfall is not None else db_rainfall
 
-    log.info(
-        "lat=%.5f lon=%.5f  nearest=(%.5f, %.5f)  "
-        "live_rain=%s  db_rain=%.2f",
-        lat, lon, nearest_lat, nearest_lon,
-        live_rainfall, db_rainfall or 0,
-    )
-
-    # 3. Build feature vector in model-expected order ───────────────────
     feature_values = {}
     for feat in feature_names:
         val = row.get(feat)
-        feature_values[feat] = val
+        feature_values[feat] = float(val) if isinstance(val, (int, float, np.number)) else val
 
-    # Override RAINFALL1 with live value if available
-    if "RAINFALL1" in feature_values:
-        feature_values["RAINFALL1"] = effective_rainfall
+    if "RAINFALL1" in feature_values and effective_rainfall is not None:
+        feature_values["RAINFALL1"] = float(effective_rainfall)
 
     X = np.array([[feature_values[f] for f in feature_names]], dtype=float)
 
-    # 4. Inference ───────────────────────────────────────────────────────
-    proba      = model.predict_proba(X)[0]   # [P(class=0), P(class=1)]
+    proba = model.predict_proba(X)[0]
     risk_score = float(proba[1])
-    tier       = classify_tier(risk_score)
-
-    log.info("Risk score=%.4f  Tier=%s", risk_score, tier)
+    tier = classify_tier(risk_score)
 
     return PredictResponse(
-        risk_score         = round(risk_score, 4),
-        tier               = tier,
-        nearest_coordinate = {"latitude": nearest_lat, "longitude": nearest_lon},
-        live_rainfall_mm   = round(live_rainfall, 2) if live_rainfall is not None else None,
-        features           = {k: round(v, 4) if isinstance(v, float) else v
-                              for k, v in feature_values.items()},
+        risk_score=round(risk_score, 4),
+        tier=tier,
+        nearest_coordinate={"latitude": nearest_lat, "longitude": nearest_lon},
+        live_rainfall_mm=round(float(live_rainfall), 2) if live_rainfall is not None else None,
+        features={
+            k: round(float(v), 4) if isinstance(v, (float, np.floating)) else v
+            for k, v in feature_values.items()
+        },
     )
 
 
-# ---------------------------------------------------------------------------
-# POST /api/report-incident
-# ---------------------------------------------------------------------------
 @app.post("/api/report-incident", response_model=ReportResponse)
 async def report_incident(payload: ReportRequest):
     engine = app_state["engine"]
@@ -265,35 +240,27 @@ async def report_incident(payload: ReportRequest):
     try:
         with engine.begin() as conn:
             result = conn.execute(insert_sql, {
-                "lat" : payload.latitude,
-                "lon" : payload.longitude,
+                "lat": payload.latitude,
+                "lon": payload.longitude,
                 "desc": payload.description,
-                "sev" : payload.severity,
+                "sev": payload.severity,
             })
             new_id = result.fetchone()[0]
     except SQLAlchemyError as exc:
         log.error("Incident insert failed: %s", exc)
         raise HTTPException(status_code=503, detail="Failed to save incident report.")
 
-    log.info("Incident #%d recorded at (%.5f, %.5f)", new_id, payload.latitude, payload.longitude)
     return ReportResponse(status="success", id=new_id)
 
 
-# ---------------------------------------------------------------------------
-# GET /health
-# ---------------------------------------------------------------------------
 @app.get("/health", tags=["Health"])
 async def health():
     return {
-        "status"  : "ok",
-        "model"   : MODEL_PATH,
+        "status": "ok",
         "features": app_state.get("feature_names", []),
     }
 
 
-# ---------------------------------------------------------------------------
-# Dev entrypoint
-# ---------------------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
