@@ -14,7 +14,7 @@ import {
 } from 'lucide-react';
 import './utils/leafletIcons';
 
-const API_BASE_URL = 'http://localhost:8000';
+const API_BASE_URL = 'https://sikkim-landslide-dashboard.onrender.com/api';
 
 // Map click listener component
 function MapClickHandler({ onLocationSelect }) {
